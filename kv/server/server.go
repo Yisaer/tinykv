@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"reflect"
 
+	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
@@ -37,23 +39,95 @@ func NewServer(storage storage.Storage) *Server {
 
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawGetResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	v, err := reader.GetCF(req.Cf, req.Key)
+
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			resp.NotFound = true
+			return resp, nil
+		}
+		return resp, err
+	}
+	if v == nil {
+		resp.NotFound = true
+		return resp, nil
+	}
+	return &kvrpcpb.RawGetResponse{
+		Value: v,
+	}, nil
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawPutResponse{}
+	put := storage.Put{
+		Cf:    req.Cf,
+		Key:   req.Key,
+		Value: req.Value,
+	}
+	op := storage.Modify{
+		Data: put,
+	}
+	batch := []storage.Modify{
+		op,
+	}
+	err := server.storage.Write(req.Context, batch)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	return resp, nil
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawDeleteResponse{}
+	del := storage.Delete{
+		Cf:  req.Cf,
+		Key: req.Key,
+	}
+	op := storage.Modify{
+		Data: del,
+	}
+	batch := []storage.Modify{
+		op,
+	}
+	err := server.storage.Write(req.Context, batch)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	return resp, nil
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
-	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawScanResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	iterator := reader.IterCF(req.Cf)
+	defer iterator.Close()
+
+	for iterator.Seek(req.StartKey); iterator.Valid() && uint32(len(resp.Kvs)) < req.Limit; iterator.Next() {
+		item := iterator.Item()
+		kvPair := &kvrpcpb.KvPair{
+			Key: item.Key(),
+		}
+		v, err := item.Value()
+		if err != nil {
+			return &kvrpcpb.RawScanResponse{}, err
+		}
+		kvPair.Value = v
+		resp.Kvs = append(resp.Kvs, kvPair)
+	}
+	return resp, nil
 }
 
 // Raft commands (tinykv <-> tinykv)
@@ -122,4 +196,20 @@ func (server *Server) Coprocessor(_ context.Context, req *coppb.Request) (*coppb
 		return server.copHandler.HandleCopAnalyzeRequest(reader, req), nil
 	}
 	return nil, nil
+}
+
+// rawRegionError assigns region errors to a RegionError field, and other errors to the Error field,
+// of resp. This is only a valid way to handle errors for the raw commands. Returns true if err is
+// non-nil, false otherwise.
+func rawRegionError(err error, resp interface{}) bool {
+	if err == nil {
+		return false
+	}
+	respValue := reflect.ValueOf(resp).Elem()
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		respValue.FieldByName("RegionError").Set(reflect.ValueOf(regionErr.RequestErr))
+	} else {
+		respValue.FieldByName("Error").Set(reflect.ValueOf(err.Error()))
+	}
+	return true
 }
