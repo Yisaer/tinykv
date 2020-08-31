@@ -16,8 +16,10 @@ package raft
 
 import (
 	"errors"
-
+	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -155,6 +157,9 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// self defined data
+	randomizedElectionTimeout int
 }
 
 // newRaft return a raft peer with the given config
@@ -162,8 +167,29 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
+	r := &Raft{
+		id:               c.ID,
+		RaftLog:          newLog(c.Storage),
+		Prs:              make(map[uint64]*Progress),
+		votes:            make(map[uint64]bool),
+		msgs:             make([]pb.Message, 0),
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
+	hardState, _, err := r.RaftLog.storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+	if !IsEmptyHardState(hardState) {
+		r.loadState(hardState)
+	}
+	if c.Applied > 0 {
+		r.RaftLog.AppliedTo(c.Applied)
+	}
+	r.becomeFollower(r.Term, None)
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	// Your Code Here (2A).
-	return nil
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -214,6 +240,20 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Index < r.RaftLog.committed {
+		r.send(pb.Message{To: m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   r.RaftLog.committed})
+		return
+	}
+
+	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries); ok {
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: mlastIndex})
+	} else {
+		log.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
+			r.id, r.RaftLog.zeroTermOnErrCompacted(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: m.Index, Reject: true})
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -234,4 +274,43 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) loadState(state pb.HardState) {
+	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
+		panic(fmt.Sprintf("%x state.commit %d is out of range [%d, %d]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex()))
+	}
+	r.RaftLog.committed = state.Commit
+	r.Term = state.Term
+	r.Vote = state.Vote
+}
+
+// send persists state to stable storage and then sends to its mailbox.
+func (r *Raft) send(m pb.Message) {
+	if m.From == None {
+		m.From = r.id
+	}
+	if m.MsgType == pb.MessageType_MsgRequestVote ||
+		m.MsgType == pb.MessageType_MsgRequestVoteResponse {
+		if m.Term == 0 {
+			// All {pre-,}campaign messages need to have the term set when
+			// sending.
+			// - MsgVote: m.Term is the term the node is campaigning for,
+			//   non-zero as we increment the term when campaigning.
+			// - MsgVoteResp: m.Term is the new r.Term if the MsgVote was
+			//   granted, non-zero for the same reason MsgVote is
+			panic(fmt.Sprintf("term should be set when sending %s", m.MsgType))
+		}
+	} else {
+		if m.Term != 0 {
+			panic(fmt.Sprintf("term should not be set when sending %s (was %d)", m.MsgType, m.Term))
+		}
+		// do not attach term to MsgProp
+		// proposals are a way to forward to the leader and
+		// should be treated as local message.
+		if m.MsgType != pb.MessageType_MsgPropose {
+			m.Term = r.Term
+		}
+	}
+	r.msgs = append(r.msgs, m)
 }

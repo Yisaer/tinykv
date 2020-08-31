@@ -14,7 +14,11 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -136,4 +140,134 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, ErrUnavailable
 	}
 	return l.entries[i-l.entries[0].Index].Term, nil
+}
+
+func (l *RaftLog) AppliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	if l.committed < i || i < l.applied {
+		panic(fmt.Sprintf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed))
+	}
+	l.applied = i
+}
+
+func (l *RaftLog) matchTerm(index, term uint64) bool {
+	t, err := l.Term(index)
+	if err != nil {
+		return false
+	}
+	return t == term
+}
+
+// findConflict finds the index of the conflict.
+// It returns the first pair of conflicting entries between the existing
+// entries and the given entries, if there are any.
+// If there is no conflicting entries, and the existing entries contains
+// all the given entries, zero will be returned.
+// If there is no conflicting entries, but the given entries contains new
+// entries, the index of the first new entry will be returned.
+// An entry is considered to be conflicting if it has the same index but
+// a different term.
+// The first entry MUST have an index equal to the argument 'from'.
+// The index of the given entries MUST be continuously increasing.
+func (l *RaftLog) findConflict(ents []*pb.Entry) uint64 {
+	for _, newEntry := range ents {
+		if !l.matchTerm(newEntry.Index, newEntry.Term) {
+			if newEntry.Index <= l.LastIndex() {
+				log.Infof(fmt.Sprintf("found conflict at index %d [existing term: %d, conflicting term: %d]",
+					newEntry.Index, l.zeroTermOnErrCompacted(l.Term(newEntry.Index)), newEntry.Term))
+			}
+			return newEntry.Index
+		}
+	}
+	return 0
+}
+
+func (l *RaftLog) commitTo(tocommit uint64) {
+	// never decrease commit
+	if l.committed < tocommit {
+		if l.LastIndex() < tocommit {
+			panic(fmt.Sprintf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.LastIndex()))
+		}
+		l.committed = tocommit
+	}
+}
+
+func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
+	if err == nil {
+		return t
+	}
+	if err == ErrCompacted {
+		return 0
+	}
+	panic(err)
+	return 0
+}
+
+func (l *RaftLog) append(ents []*pb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
+	after := ents[0].Index - 1
+	if after < l.committed {
+		panic(fmt.Sprintf("after(%d) is out of range [committed(%d)]", after, l.committed))
+
+	}
+	// if l.entries is empty, it would be captured in this branch
+	if after == l.LastIndex()+1 {
+		for _, entry := range ents {
+			l.entries = append(l.entries, *entry)
+		}
+		return
+	}
+	if after > l.LastIndex()+1 {
+		log.Panicf("after is too big")
+	}
+	if len(l.entries) < 1 {
+		panic("entries shouldn't be empty here")
+	}
+	fi := l.entries[0].Index
+	// 3,4,5
+	// 1,2
+	// 5,6,7
+	// 2,3,4
+	// TODO: ensure that whether ents[0].Index would less than fi
+	if ents[0].Index < fi {
+		if ents[0].Index+uint64(len(ents)) <= fi {
+			panic("ents length small")
+		}
+		ents = ents[fi-ents[0].Index:]
+	}
+	// 2,3,4,5
+	// 3,4,5
+	l.entries = l.entries[:ents[0].Index-fi]
+	for _, ent := range ents {
+		l.entries = append(l.entries, *ent)
+	}
+}
+
+// maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
+// it returns (last index of new entries, true).
+func (l *RaftLog) maybeAppend(prevIndex, prevlogTerm, committed uint64, ents []*pb.Entry) (lastnewi uint64, ok bool) {
+	if l.matchTerm(prevIndex, prevlogTerm) {
+		lastnewi = prevIndex + uint64(len(ents))
+		ci := l.findConflict(ents)
+		switch {
+		case ci == 0:
+		case ci <= l.committed:
+			log.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
+		default:
+			// index 3
+			// ents 4,5,6,7,8
+			// ci 6,offset 3+1 = 4
+			// ci-offset = 6-4 = 2
+			// ents[ci-offset:] = 6,7,8
+			offset := prevIndex + 1
+			l.append(ents[ci-offset:])
+		}
+		l.commitTo(min(committed, lastnewi))
+		return lastnewi, true
+	}
+	return 0, false
 }

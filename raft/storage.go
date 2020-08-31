@@ -107,6 +107,7 @@ func (ms *MemoryStorage) SetHardState(st pb.HardState) error {
 }
 
 // Entries implements the Storage interface.
+// 1
 func (ms *MemoryStorage) Entries(lo, hi uint64) ([]pb.Entry, error) {
 	ms.Lock()
 	defer ms.Unlock()
@@ -118,6 +119,7 @@ func (ms *MemoryStorage) Entries(lo, hi uint64) ([]pb.Entry, error) {
 		log.Panicf("entries' hi(%d) is out of bound lastindex(%d)", hi, ms.lastIndex())
 	}
 
+	// offset 0
 	ents := ms.ents[lo-offset : hi-offset]
 	if len(ms.ents) == 1 && len(ents) != 0 {
 		// only contains dummy entries.
@@ -253,11 +255,20 @@ func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 	if last < first {
 		return nil
 	}
+
+	// origin   4,5, 6, 7, 8
+	// entries: 9,10,11,12
+	// entries 3,4,5,6,7,8,9
+	// first 5, entries 0: 3 -> entries 0: 5,6,7,8,9
 	// truncate compacted entries
+	// first = 3
+	// entries 1,2,3,4,5
+	// result entries: 3,4,5
 	if first > entries[0].Index {
 		entries = entries[first-entries[0].Index:]
 	}
 
+	// 合并逻辑
 	offset := entries[0].Index - ms.ents[0].Index
 	switch {
 	case uint64(len(ms.ents)) > offset:
