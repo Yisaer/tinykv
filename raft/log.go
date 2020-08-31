@@ -56,7 +56,28 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	if storage == nil {
+		panic("storage should be initialized")
+	}
+	fi, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	li, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	entries, err := storage.Entries(fi, li+1)
+	if err != nil {
+		panic(err)
+	}
+	return &RaftLog{
+		storage:   storage,
+		committed: fi - 1,
+		applied:   fi - 1,
+		stabled:   li,
+		entries:   entries,
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -69,23 +90,50 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		if l.stabled >= l.entries[len(l.entries)-1].Index {
+			return nil
+		}
+		firstIndex := l.entries[0].Index
+		return l.entries[l.stabled-firstIndex+1:]
+	}
 	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 && l.applied < l.committed {
+		firstIndex := l.entries[0].Index
+		// firstIndex  applied  committed
+		// 10          11 12 13 14
+		// 0           1  2  3  4
+		return l.entries[l.applied-firstIndex+1 : l.committed-firstIndex+1]
+	}
 	return nil
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) > 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
+	li, err := l.storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	return li
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if len(l.entries) < 1 || l.entries[0].Index > i {
+		return l.storage.Term(i)
+	}
+	if l.entries[len(l.entries)-1].Index < i {
+		return 0, ErrUnavailable
+	}
+	return l.entries[i-l.entries[0].Index].Term, nil
 }
